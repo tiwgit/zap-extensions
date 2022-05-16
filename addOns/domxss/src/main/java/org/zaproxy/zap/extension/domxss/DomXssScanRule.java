@@ -46,6 +46,7 @@ import org.openqa.selenium.WebElement;
 import org.openqa.selenium.remote.CapabilityType;
 import org.openqa.selenium.remote.UnreachableBrowserException;
 import org.parosproxy.paros.Constant;
+import org.parosproxy.paros.control.Control;
 import org.parosproxy.paros.core.scanner.AbstractAppParamPlugin;
 import org.parosproxy.paros.core.scanner.Alert;
 import org.parosproxy.paros.core.scanner.Category;
@@ -53,13 +54,18 @@ import org.parosproxy.paros.core.scanner.NameValuePair;
 import org.parosproxy.paros.core.scanner.Plugin;
 import org.parosproxy.paros.network.HtmlParameter;
 import org.parosproxy.paros.network.HttpMessage;
+import org.parosproxy.paros.network.HttpSender;
 import org.zaproxy.addon.commonlib.CommonAlertTag;
 import org.zaproxy.addon.network.ExtensionNetwork;
 import org.zaproxy.addon.network.server.HttpMessageHandler;
 import org.zaproxy.addon.network.server.HttpMessageHandlerContext;
 import org.zaproxy.addon.network.server.Server;
+import org.zaproxy.zap.extension.script.ExtensionScript;
+import org.zaproxy.zap.extension.script.ScriptWrapper;
 import org.zaproxy.zap.extension.selenium.Browser;
 import org.zaproxy.zap.extension.selenium.ExtensionSelenium;
+import org.zaproxy.zap.extension.selenium.SeleniumScript;
+import org.zaproxy.zap.extension.selenium.SeleniumScriptUtils;
 import org.zaproxy.zap.model.Vulnerabilities;
 import org.zaproxy.zap.model.Vulnerability;
 import org.zaproxy.zap.utils.Stats;
@@ -114,7 +120,7 @@ public class DomXssScanRule extends AbstractAppParamPlugin {
     /** The name of the rule to obtain the ID of the browser. */
     private static final String RULE_BROWSER_ID = "rules.domxss.browserid";
 
-    private static final Browser DEFAULT_BROWSER = Browser.FIREFOX_HEADLESS;
+    private static final Browser DEFAULT_BROWSER = Browser.CHROME;
     private static final Map<String, String> ALERT_TAGS =
             CommonAlertTag.toMap(
                     CommonAlertTag.OWASP_2021_A03_INJECTION,
@@ -229,19 +235,32 @@ public class DomXssScanRule extends AbstractAppParamPlugin {
         if (proxy == null) {
             proxy =
                     extensionNetwork.createHttpProxy(
-                            -1,
+                            HttpSender.ACTIVE_SCANNER_INITIATOR,
                             new HttpMessageHandler() {
 
                                 @Override
                                 public void handleMessage(
                                         HttpMessageHandlerContext ctx, HttpMessage msg) {
-                                    ctx.overridden();
-
                                     try {
-                                        // Ideally it should check that the message belongs
-                                        // to the scanned
-                                        // target before sending
-                                        sendAndReceive(msg);
+                                        if (!msg.isInScope()) {
+                                            log.warn(
+                                                    "Out of scope message:"
+                                                            + msg.getRequestHeader()
+                                                                    .getURI()
+                                                                    .toString());
+                                            msg.setTimeSentMillis(System.currentTimeMillis());
+                                            msg.setTimeElapsedMillis(0);
+                                            msg.setResponseBody("403 Forbidden");
+                                            msg.setResponseHeader(
+                                                    "HTTP/1.1 403 Forbidden\r\n"
+                                                            + "Content-Type: text/plain; charset=utf-8");
+                                            msg.getResponseHeader()
+                                                    .setContentLength(
+                                                            msg.getResponseBody().length());
+                                        } else {
+                                            sendAndReceive(msg, false);
+                                        }
+                                        ctx.overridden();
                                     } catch (IOException e) {
                                         log.debug(e);
                                     }
@@ -267,8 +286,48 @@ public class DomXssScanRule extends AbstractAppParamPlugin {
                                         CapabilityType.UNEXPECTED_ALERT_BEHAVIOUR,
                                         UnexpectedAlertBehaviour.IGNORE));
 
-        webDriver.manage().timeouts().pageLoadTimeout(10, TimeUnit.SECONDS);
-        webDriver.manage().timeouts().setScriptTimeout(10, TimeUnit.SECONDS);
+        webDriver.manage().timeouts().pageLoadTimeout(90, TimeUnit.SECONDS);
+        webDriver.manage().timeouts().setScriptTimeout(90, TimeUnit.SECONDS);
+
+        ExtensionScript extScript =
+                Control.getSingleton().getExtensionLoader().getExtension(ExtensionScript.class);
+
+        if (extScript != null) {
+            List<ScriptWrapper> scripts = extScript.getScripts("selenium");
+            for (ScriptWrapper script : scripts) {
+                try {
+                    if (script.isEnabled()) {
+                        SeleniumScript s = extScript.getInterface(script, SeleniumScript.class);
+
+                        if (s != null) {
+                            Runnable runnable =
+                                    () -> {
+                                        try {
+                                            s.browserLaunched(
+                                                    new SeleniumScriptUtils(
+                                                            webDriver,
+                                                            HttpSender.ACTIVE_SCANNER_INITIATOR,
+                                                            browser.getId(),
+                                                            "127.0.0.1",
+                                                            proxyPort));
+                                        } catch (Exception e) {
+                                            extScript.handleScriptException(script, e);
+                                        }
+                                    };
+                            runnable.run();
+                        } else {
+                            extScript.handleFailedScriptInterface(
+                                    script,
+                                    Constant.messages.getString(
+                                            "selenium.scripts.interface.error", script.getName()));
+                        }
+                    }
+
+                } catch (Exception e) {
+                    extScript.handleScriptException(script, e);
+                }
+            }
+        }
 
         return webDriver;
     }
